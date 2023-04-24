@@ -10,14 +10,27 @@ import (
 	"net/url"
 	"os/exec"
 	"regexp"
+	"strings"
 
+	"github.com/billikeu/Go-EdgeGPT/edgegpt"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
-	"github.com/pavel-one/EdgeGPT-Go"
 	"github.com/sashabaranov/go-openai"
 )
 
 const apiKey = "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" // 替换为您的实际 OpenAI API 密钥
+
+type ABIEvent struct {
+	Anonymous bool              `json:"anonymous"`
+	Inputs    []json.RawMessage `json:"inputs"`
+	Name      string            `json:"name"`
+	Type      string            `json:"type"`
+}
+
+type ABIInput struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
 
 type OpenAIRequest struct {
 	Prompt string `json:"prompt"`
@@ -25,6 +38,18 @@ type OpenAIRequest struct {
 
 type EventOutput struct {
 	Events []string `json:"events"`
+}
+
+type ABIElement struct {
+	Type    string            `json:"type"`
+	Name    string            `json:"name,omitempty"`
+	Inputs  []json.RawMessage `json:"inputs,omitempty"`
+	Outputs []json.RawMessage `json:"outputs,omitempty"`
+}
+
+type ABIOutput struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
 }
 
 type OpenAIResponse struct {
@@ -39,6 +64,8 @@ type OpenAIResponse struct {
 		FinishReason string      `json:"finish_reason"`
 	} `json:"choices"`
 }
+
+var globalString string = "globalString"
 
 func main() {
 	// 创建路由
@@ -64,7 +91,7 @@ func main() {
 		}
 		dsl := inputData["dsl"]
 		// cookie := inputData["cookie"]
-		fmt.Println(dsl)
+		// fmt.Println(dsl)
 		// 处理 DSL 代码，生成新的代码
 		// 调用 NewBing API 处理 DSL 代码，生成新的代码
 		processedCodeFrombing := processDSLNewBing(dsl)
@@ -73,6 +100,7 @@ func main() {
 	})
 
 	// 定义路由
+
 	router.POST("/generate", func(c *gin.Context) {
 		// 获取请求中的数据
 		var inputData map[string]string
@@ -87,6 +115,7 @@ func main() {
 		processedCode := processDSL(dsl)
 
 		// 返回处理后的代码
+
 		c.JSON(http.StatusOK, gin.H{"code": processedCode})
 	})
 	router.POST("/compile", func(c *gin.Context) {
@@ -106,7 +135,6 @@ func main() {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "编译过程中发生错误"})
 			return
 		}
-
 		// 返回编译结果
 		c.JSON(http.StatusOK, gin.H{"abi": compiledResult["abi"], "bytecode": compiledResult["bytecode"]})
 	})
@@ -126,36 +154,62 @@ func generateEventsHandler(c *gin.Context) {
 		return
 	}
 
-	events := generateEvents(inputData["input"])
-	eventOutput := EventOutput{Events: events}
+	compiledResult, err := compileSolidity(inputData["input"])
+	if err != nil {
+		log.Println(err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "编译过程中发生错误"})
+		return
+	}
 
-	output, err := json.Marshal(eventOutput)
+	abiBytes, err := json.Marshal(compiledResult["abi"])
+	if err != nil {
+		log.Println(err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "序列化 ABI 失败"})
+		return
+	}
+	abi := string(abiBytes)
+
+	events, err := generateEvents(abi)
+
+	// 将事件列表直接序列化为 JSON 数组，而不是序列化整个结构体
+	// output, err := json.Marshal(events)
 	if err != nil {
 		log.Println(err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "生成事件失败"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"events": output})
+	c.JSON(http.StatusOK, gin.H{"events": events})
+
 }
 
-func generateEvents(contractCode string) []string {
-	// 定义变量命名规则的正则表达式
-	variableRegex := regexp.MustCompile(`(uint256|uint|address|bool)\s+_([a-zA-Z0-9]+);`)
-
-	// 查找所有符合规则的变量
-	matches := variableRegex.FindAllStringSubmatch(contractCode, -1)
-
-	var events []string
-	for _, match := range matches {
-		varType := match[1]
-		varName := match[2]
-		eventName := fmt.Sprintf("%sChanged", varName)
-		eventSignature := fmt.Sprintf("event %s(%s _newValue);", eventName, varType)
-		events = append(events, eventSignature)
+func generateEvents(abi string) ([]string, error) {
+	var abiEvents []ABIEvent
+	err := json.Unmarshal([]byte(abi), &abiEvents)
+	if err != nil {
+		return nil, fmt.Errorf("解析 ABI 失败: %v", err)
 	}
 
-	return events
+	eventRegex := regexp.MustCompile(`^(Investment|Withdrawal|Earnings|Distribution)[a-zA-Z0-9]+`)
+
+	var events []string
+	for _, event := range abiEvents {
+		if event.Type == "event" && eventRegex.MatchString(event.Name) {
+			var inputParams []string
+			for _, input := range event.Inputs {
+				var inputParam ABIInput
+				err := json.Unmarshal(input, &inputParam)
+				if err != nil {
+					return nil, fmt.Errorf("解析 ABI 事件输入参数失败: %v", err)
+				}
+				inputParams = append(inputParams, fmt.Sprintf("%v %v", inputParam.Type, inputParam.Name))
+			}
+			eventSignature := fmt.Sprintf("event %s(%s);", event.Name, strings.Join(inputParams, ", "))
+			events = append(events, eventSignature)
+		}
+	}
+
+	return events, nil
 }
 
 func compileSolidity(code string) (map[string]interface{}, error) {
@@ -190,37 +244,37 @@ func compileSolidity(code string) (map[string]interface{}, error) {
 	return compiledResult, nil
 }
 
+func callback(answer *edgegpt.Answer) {
+	if answer.IsDone() {
+		log.Println("Done", answer.Text())
+		globalString = answer.Text()
+		// log.Println(answer.NumUserMessages(), answer.MaxNumUserMessages(), answer.Text())
+	}
+}
+
 func processDSLNewBing(dsl string) string {
-	s := EdgeGPT.NewStorage()
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	bot := edgegpt.NewChatBot("cookie.json", []map[string]interface{}{}, "http://127.0.0.1:7890")
+	err := bot.Init()
 
-	gpt, err := s.GetOrSet("any-key")
 	if err != nil {
-		log.Fatalln(err)
+		panic(err)
 	}
-
-	// send ask async
-	mw, err := gpt.AskAsync("Hi, you're alive?")
+	err = bot.Ask("请你给我的回复中不要带有任何emoji表情", edgegpt.Creative, callback)
 	if err != nil {
-		log.Fatalln(err)
+		panic(err)
 	}
 
-	go mw.Worker() // start worker
-
-	for range mw.Chan {
-		// update answer
-		log.Println(mw.Answer.GetAnswer())
-		log.Println(mw.Answer.GetType())
-		log.Println(mw.Answer.GetSuggestions())
-		log.Println(mw.Answer.GetMaxUnit())
-		log.Println(mw.Answer.GetUserUnit())
-	}
-
-	// send sync ask
-	as, err := gpt.AskSync(dsl)
+	err = bot.Ask(dsl, edgegpt.Creative, callback)
 	if err != nil {
-		log.Fatalln(err)
+		panic(err)
 	}
-	return as.Answer.GetAnswer()
+	return globalString
+
+	// err = bot.Ask("It's not funny", edgegpt.Creative, callback)
+	// if err != nil {
+	// 	panic(err)
+	// }
 
 }
 
